@@ -1,0 +1,331 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>Multi-Pointer & Polygon Geofence Simulation</title>
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css" />
+
+<style>
+  :root{--ok:#4CAF50; --bad:#f44336; --white:#fff; --p1-color:#0077ff; --p2-color:#ff9800; --p3-color:#9c27b0;}
+  body{font-family:Inter,system-ui,Arial;margin:0;color:#111;background:#f9f9f9; display: flex; flex-direction: column; height: 100vh;}
+  .main-layout{display:flex; flex: 1; min-height: 0;}
+  .left-panel{flex: 1; display: flex; flex-direction: column;}
+  .right-panel{width:400px; padding: 12px; overflow-y: auto; background-color: #f9f9f9;}
+  
+  #map { width: 100%; flex: 1; cursor: crosshair; }
+
+  .controls { padding: 12px; background: #fff; border-bottom: 1px solid #ccc; display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
+  .controls label { font-weight: 500; user-select: none; }
+  .controls select { padding: 5px; border-radius: 4px; border: 1px solid #ccc; }
+
+  .geofence-manager { padding: 12px; background: #f0f0f0; border-bottom: 1px solid #ccc; max-height: 200px; overflow-y: auto; }
+  .geofence-manager h3 { margin: 0 0 8px; }
+  .geofence-list-item { background: #fff; padding: 8px; border-radius: 4px; margin-bottom: 5px; display: flex; justify-content: space-between; align-items: center; border: 1px solid #ddd; }
+  .geofence-list-item.breached { border-left: 4px solid var(--bad); }
+  .geofence-list-item.safe { border-left: 4px solid var(--ok); }
+  .delete-btn { background: #f44336; color: white; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+  .delete-btn:hover { background: #d32f2f; }
+
+  .nodes{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+  .node{flex-basis: 100%; border-radius:8px; border:1px solid #ddd; padding:8px; background:#fff; margin-bottom: 8px;}
+  .node .id{font-weight:700}
+  .node.p1 { border-left: 4px solid var(--p1-color); }
+  .node.p2 { border-left: 4px solid var(--p2-color); }
+  .node.p3 { border-left: 4px solid var(--p3-color); }
+  .cipher{font-family:monospace;font-size:12px;margin-top:6px;min-height:18px;background:#fafafa;padding:6px;border-radius:6px;word-break:break-word; color: #555;}
+  .cipher-empty{color:#999;}
+  .server{border-radius:8px; border:1px solid #bbb; padding:10px; margin-top:10px; background:#fff;}
+  .decrypted{font-family:monospace; white-space:pre; margin-top:8px; background:#fffef2; padding:8px; border-radius:6px; min-height:54px; font-size: 12px; }
+  .small{font-size:13px;color:#555}
+</style>
+</head>
+<body>
+
+  <div class="main-layout">
+    <div class="left-panel">
+        <div class="controls">
+            <div>
+                <label for="pointerSelect">Pointer to Move:</label>
+                <select id="pointerSelect">
+                    <option value="0">Pointer 1 (Blue)</option>
+                    <option value="1">Pointer 2 (Orange)</option>
+                    <option value="2">Pointer 3 (Purple)</option>
+                </select>
+            </div>
+            <div class="small">Use map tools (top-left) to draw polygon geofences.</div>
+        </div>
+        <div id="map"></div>
+        <div class="geofence-manager">
+            <h3>Geofence Manager</h3>
+            <div id="geofenceList">
+                <div class="small">No geofences created.</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="right-panel">
+      <h2>Simulation Panel</h2>
+      <p class="small">Pointers transmit data when inside any geofenced area.</p>
+      <div id="nodesContainer"></div>
+
+      <div class="server">
+        <div style="font-weight:700">Server Decryption Log</div>
+        <div id="decryptedList" class="decrypted">—</div>
+      </div>
+    </div>
+  </div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+
+<script>
+/* --- CONFIG --- */
+const POINTER_COUNT = 3;
+const POINTER_COLORS = ['#0077ff', '#ff9800', '#9c27b0'];
+const GEOFENCE_COLORS = {
+    safe: '#4CAF50',
+    breached: '#f44336'
+};
+
+/* --- DOM REFS --- */
+const pointerSelect = document.getElementById('pointerSelect');
+const nodesContainer = document.getElementById('nodesContainer');
+const decryptedListEl = document.getElementById('decryptedList');
+const geofenceListEl = document.getElementById('geofenceList');
+
+/* --- MAP & SIMULATION STATE --- */
+let map;
+let deviceMarkers = new Array(POINTER_COUNT).fill(null);
+let geofencePolygons = [];
+let sendingTimers = new Array(POINTER_COUNT).fill(null);
+let latestCoords = new Array(POINTER_COUNT).fill(null);
+let logHistory = [];
+
+/* --- MAP INITIALIZATION --- */
+function initMap() {
+    map = L.map('map').setView([28.6139, 77.2090], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+    }).addTo(map);
+
+    // Init Draw Controls
+    const drawnItems = new L.FeatureGroup();
+    map.addLayer(drawnItems);
+    const drawControl = new L.Control.Draw({
+        draw: {
+            polygon: {
+                allowIntersection: false,
+                showArea: true
+            },
+            polyline: false, rectangle: false, circle: false, marker: false, circlemarker: false
+        },
+        edit: {
+            featureGroup: drawnItems
+        }
+    });
+    map.addControl(drawControl);
+
+    map.on(L.Draw.Event.CREATED, (event) => {
+        const layer = event.layer;
+        const id = L.stamp(layer);
+        layer._id = id;
+        layer.setStyle({ color: GEOFENCE_COLORS.safe, weight: 2 });
+        drawnItems.addLayer(layer);
+        geofencePolygons.push(layer);
+        updateGeofenceList();
+        checkAllStates();
+    });
+    map.on('draw:edited', () => checkAllStates());
+    map.on('draw:deleted', (e) => {
+        e.layers.eachLayer(layer => {
+            geofencePolygons = geofencePolygons.filter(p => p._id !== layer._id);
+        });
+        updateGeofenceList();
+        checkAllStates();
+    });
+
+    map.on('click', onMapClick);
+}
+
+/* --- POINTER & GEOFENCE LOGIC --- */
+function onMapClick(e) {
+    const pointerIndex = parseInt(pointerSelect.value, 10);
+    setDeviceLocation(pointerIndex, e.latlng);
+}
+
+function setDeviceLocation(index, latlng) {
+    latestCoords[index] = { lat: latlng.lat, lon: latlng.lng };
+    if (!deviceMarkers[index]) {
+        deviceMarkers[index] = L.circleMarker(latlng, {
+            radius: 8,
+            color: '#ffffff',
+            weight: 2,
+            fillColor: POINTER_COLORS[index],
+            fillOpacity: 1
+        }).addTo(map).bindTooltip('Pointer ' + (index + 1), { permanent: true, direction: 'top', offset: [0, -10] });
+    } else {
+        deviceMarkers[index].setLatLng(latlng);
+    }
+    checkAllStates();
+}
+
+function isMarkerInsidePolygon(marker, polygon) {
+    if (!marker) return false;
+    const latlng = marker.getLatLng();
+    const polyPoints = polygon.getLatLngs()[0];
+    let x = latlng.lng, y = latlng.lat;
+    let inside = false;
+    for (let i = 0, j = polyPoints.length - 1; i < polyPoints.length; j = i++) {
+        let xi = polyPoints[i].lng, yi = polyPoints[i].lat;
+        let xj = polyPoints[j].lng, yj = polyPoints[j].lat;
+        let intersect = ((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+        if (intersect) inside = !inside;
+    }
+    return inside;
+}
+
+function checkAllStates() {
+    let anyBreaches = false;
+    // Update geofence states
+    geofencePolygons.forEach(poly => {
+        let isBreached = false;
+        for (let i = 0; i < POINTER_COUNT; i++) {
+            if (isMarkerInsidePolygon(deviceMarkers[i], poly)) {
+                isBreached = true;
+                break;
+            }
+        }
+        poly.setStyle({ color: isBreached ? GEOFENCE_COLORS.breached : GEOFENCE_COLORS.safe });
+    });
+    
+    // Update pointer states
+    for (let i = 0; i < POINTER_COUNT; i++) {
+        let isInsideAnyFence = false;
+        if (deviceMarkers[i]) {
+            for (const poly of geofencePolygons) {
+                if (isMarkerInsidePolygon(deviceMarkers[i], poly)) {
+                    isInsideAnyFence = true;
+                    break;
+                }
+            }
+        }
+        
+        if (isInsideAnyFence && !sendingTimers[i]) {
+            startSending(i);
+        } else if (!isInsideAnyFence && sendingTimers[i]) {
+            stopSending(i);
+        }
+    }
+    updateGeofenceList();
+}
+
+
+/* --- SIMULATION UI & LOGIC --- */
+function buildNodeUI() {
+    nodesContainer.innerHTML = '';
+    for (let i = 0; i < POINTER_COUNT; i++) {
+        const el = document.createElement('div');
+        el.className = 'node p' + (i+1);
+        el.innerHTML = '<div class="id">Pointer ' + (i+1) + '</div>';
+        const cipherEl = document.createElement('div');
+        cipherEl.id = 'cipher-' + i;
+        cipherEl.className = 'cipher cipher-empty';
+        cipherEl.textContent = 'Safe Zone';
+        el.appendChild(cipherEl);
+        nodesContainer.appendChild(el);
+    }
+}
+
+function updateGeofenceList() {
+    if (geofencePolygons.length === 0) {
+        geofenceListEl.innerHTML = '<div class="small">No geofences created.</div>';
+        return;
+    }
+    geofenceListEl.innerHTML = '';
+    geofencePolygons.forEach((poly, index) => {
+        let breachedBy = [];
+        for (let i = 0; i < POINTER_COUNT; i++) {
+            if (isMarkerInsidePolygon(deviceMarkers[i], poly)) {
+                breachedBy.push('P' + (i+1));
+            }
+        }
+        const statusClass = breachedBy.length > 0 ? 'breached' : 'safe';
+        const statusText = breachedBy.length > 0 ? 'Breached by: ' + breachedBy.join(', ') : 'Status: Safe';
+        
+        const item = document.createElement('div');
+        item.className = 'geofence-list-item ' + statusClass;
+        item.innerHTML = '<span><b>Area ' + (index + 1) + '</b> - ' + statusText + '</span>';
+        geofenceListEl.appendChild(item);
+    });
+}
+
+function startSending(index) {
+    if (sendingTimers[index]) return;
+    const cipherEl = document.getElementById('cipher-' + index);
+    
+    sendingTimers[index] = setInterval(() => {
+        if (!latestCoords[index]) return;
+        const coordsStr = latestCoords[index].lat.toFixed(5) + ',' + latestCoords[index].lon.toFixed(5);
+        const key = 'keyForPointer' + index;
+        const ct = xorEncryptToBase64(coordsStr, key);
+        
+        cipherEl.textContent = ct;
+        cipherEl.classList.remove('cipher-empty');
+
+        const plain = xorDecryptFromBase64(ct, key);
+        addToLog('P' + (index + 1) + ': ' + plain);
+
+    }, 200 + (index * 50)); // Stagger intervals
+}
+
+function stopSending(index) {
+    if (sendingTimers[index]) {
+        clearInterval(sendingTimers[index]);
+        sendingTimers[index] = null;
+        const cipherEl = document.getElementById('cipher-' + index);
+        cipherEl.textContent = 'Safe Zone';
+        cipherEl.classList.add('cipher-empty');
+    }
+}
+
+function addToLog(message) {
+    const timestamp = new Date().toLocaleTimeString();
+    logHistory.unshift('[' + timestamp + '] ' + message);
+    if (logHistory.length > 10) {
+        logHistory.pop();
+    }
+    decryptedListEl.textContent = logHistory.join('\n');
+}
+
+/* --- HELPERS --- */
+function xorEncryptToBase64(str, key) {
+    let out = '';
+    for (let i = 0; i < str.length; i++) {
+        out += String.fromCharCode(str.charCodeAt(i) ^ key.charCodeAt(i % key.length));
+    }
+    return btoa(out);
+}
+
+function xorDecryptFromBase64(b64, key) {
+    try {
+        const bin = atob(b64);
+        let out = '';
+        for (let i = 0; i < bin.length; i++) {
+            out += String.fromCharCode(bin.charCodeAt(i) ^ key.charCodeAt(i % key.length));
+        }
+        return out;
+    } catch (e) { return null; }
+}
+
+
+/* --- INITIALIZATION --- */
+document.addEventListener('DOMContentLoaded', () => {
+    initMap();
+    buildNodeUI();
+});
+</script>
+</body>
+</html>
